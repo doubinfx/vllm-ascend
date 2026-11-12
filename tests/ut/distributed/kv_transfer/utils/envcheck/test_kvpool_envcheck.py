@@ -32,8 +32,8 @@ class KvpoolEnvcheckTests(unittest.TestCase):
     def setUpClass(cls):
         cls.catalog = json.loads((ROOT / "rules.json").read_text(encoding="utf-8"))
 
-    def test_tool_version_is_first_release(self):
-        self.assertEqual(MODULE.TOOL_VERSION, "1.0.0")
+    def test_tool_version_tracks_a5_support(self):
+        self.assertEqual(MODULE.TOOL_VERSION, "1.1.0")
 
     def rule(self, rule_id):
         return next(rule for rule in self.catalog["rules"] if rule["id"] == rule_id)
@@ -48,6 +48,7 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             "link_type": "hccs",
             "ssd_offload": ssd_offload,
             "ssd_path": ssd_path,
+            "peer_eid": None,
             "fix": fix,
             "output_dir": None,
             "catalog": str(ROOT / "rules.json"),
@@ -82,6 +83,9 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             ("A3", "mooncake", "25.4.9", "BLOCK"),
             ("A3", "mooncake", "25.5.0", "PASS"),
             ("A3", "mooncake", "26.0.0", "PASS"),
+            ("A5", "memcache", "25.5.9", "BLOCK"),
+            ("A5", "memcache", "25.6.0", "PASS"),
+            ("A5", "mooncake", "25.6.rc3.1", "PASS"),
         )
         for hardware, backend, value, expected in cases:
             result = MODULE.evaluate_hdk_requirement(
@@ -220,6 +224,86 @@ class KvpoolEnvcheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "capability")
 
+    def test_a5_memory_uses_mem_available(self):
+        with patch.object(
+            MODULE,
+            "read_proc_meminfo",
+            return_value={
+                "MemTotal": "16777216 kB",
+                "MemAvailable": "8388608 kB",
+            },
+        ):
+            available = MODULE.probe_a5_memory_capacity(8192)
+            insufficient = MODULE.probe_a5_memory_capacity(8193)
+        self.assertTrue(available["ok"])
+        self.assertEqual(available["available_memory_mb"], 8192)
+        self.assertFalse(insufficient["ok"])
+        self.assertEqual(insufficient["failure_kind"], "capacity")
+
+    def test_a5_memory_fails_closed_without_mem_available(self):
+        with patch.object(MODULE, "read_proc_meminfo", return_value={"MemTotal": "1024 kB"}):
+            result = MODULE.probe_a5_memory_capacity(1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "capability")
+
+    def test_a5_hugepages_warn_and_fix(self):
+        rule = self.rule("A5-HUGEPAGE-001")
+        before = {
+            "method": "a5_hugepages",
+            "ok": False,
+            "evidence_complete": True,
+            "entries": [
+                {"node": 0, "page_size_kb": 2048, "configured_pages": 2, "path": "/tmp/hp2"},
+                {"node": 0, "page_size_kb": 1048576, "configured_pages": 1, "path": "/tmp/hp1"},
+            ],
+            "residual_entries": [
+                {"node": 0, "page_size_kb": 2048, "configured_pages": 2, "path": "/tmp/hp2"},
+                {"node": 0, "page_size_kb": 1048576, "configured_pages": 1, "path": "/tmp/hp1"},
+            ],
+            "errors": [],
+        }
+        evaluated = MODULE.evaluate_a5_hugepages(rule, {"a5_hugepages": before})
+        self.assertEqual(evaluated["status"], "WARN")
+        self.assertFalse(MODULE.is_blocking_result(evaluated))
+        self.assertEqual(evaluated["evidence"]["residual_entries"], before["residual_entries"])
+        after = {
+            "method": "a5_hugepages",
+            "ok": True,
+            "evidence_complete": True,
+            "entries": [
+                {"node": 0, "page_size_kb": 2048, "configured_pages": 0, "path": "/tmp/hp2"},
+                {"node": 0, "page_size_kb": 1048576, "configured_pages": 0, "path": "/tmp/hp1"},
+            ],
+            "residual_entries": [],
+            "errors": [],
+        }
+        with (
+            patch.object(MODULE.os, "geteuid", return_value=0),
+            patch.object(MODULE.Path, "write_text") as write_mock,
+            patch.object(MODULE, "probe_a5_hugepages", return_value=after),
+        ):
+            final, action = MODULE.fix_a5_hugepages(
+                rule,
+                MODULE.CheckContext("A5", "mooncake", 1024, link_type="ub"),
+                evaluated,
+            )
+        self.assertEqual(final["status"], "PASS")
+        self.assertEqual(action["status"], "SUCCESS")
+        self.assertEqual(write_mock.call_count, 2)
+
+    def test_a5_hugepages_missing_evidence_blocks(self):
+        probe = {
+            "method": "a5_hugepages",
+            "ok": False,
+            "evidence_complete": False,
+            "entries": [],
+            "residual_entries": [],
+            "errors": ["/sys/devices/system/node: unavailable"],
+        }
+        result = MODULE.evaluate_a5_hugepages(self.rule("A5-HUGEPAGE-001"), {"a5_hugepages": probe})
+        self.assertEqual(result["status"], "BLOCK")
+        self.assertTrue(MODULE.is_blocking_result(result))
+
     def test_memory_block_size_fails_closed_when_sysfs_is_unavailable_or_invalid(self):
         MEM_SCAN.get_memory_block_size.cache_clear()
         with (
@@ -264,6 +348,9 @@ class KvpoolEnvcheckTests(unittest.TestCase):
         self.assertTrue(MODULE.applies(self.rule("LINGQU-001"), "A3", "mooncake", "hccs", "multi-node"))
         self.assertFalse(MODULE.applies(self.rule("LINGQU-001"), "A3", "mooncake", "hccs", "single-node"))
         self.assertFalse(MODULE.applies(self.rule("LINGQU-001"), "A3", "mooncake", "roce", "multi-node"))
+        self.assertTrue(MODULE.applies(self.rule("A5-UB-001"), "A5", "mooncake", "ub", "multi-node"))
+        self.assertFalse(MODULE.applies(self.rule("A5-UB-001"), "A5", "mooncake", "roce", "multi-node"))
+        self.assertFalse(MODULE.applies(self.rule("ROCE-001"), "A5", "mooncake", "ub", "multi-node"))
 
     def test_a2_910b4_name_identifies_hardware_and_topology(self):
         npu_output = """\
@@ -335,6 +422,41 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             result = MODULE.probe_hardware(self.catalog["hardware_identification"])
         self.assertIsNone(result["model"])
         self.assertEqual(result["observed"]["dies_by_npu"], {"4": 1})
+
+    def test_a5_950dt_identifies_a5(self):
+        npu_output = """\
+| NPU ID | Name             | Health        | Power(W)              |
+| 0      | Ascend950DT      | OK            | 449.9                 |
+| 1      | Ascend950DT      | OK            | 453.1                 |
+| NPU ID | Process id       | Process name  | Process memory(MB)    |
+"""
+        topology = MODULE.parse_npu_topology(npu_output)
+        self.assertEqual(topology["npu_ids"], [0, 1])
+        self.assertEqual(topology["chips_per_npu"], 1)
+        self.assertEqual(topology["device_names"], ["Ascend950DT"])
+        with patch.object(MODULE, "run_cmd", return_value=(0, npu_output, "")):
+            result = MODULE.probe_hardware(self.catalog["hardware_identification"])
+        self.assertEqual(result["model"], "A5")
+        self.assertEqual(result["match_details"]["A5"]["matched"], ["all_device_names", "dies_per_npu"])
+        self.assertEqual(result["match_details"]["A5"]["dies_by_npu"], {0: 1, 1: 1})
+
+    def test_a5_link_type_and_peer_eid_are_enforced(self):
+        catalog = self.catalog
+        detected = {
+            "model": "A5",
+            "candidates": ["A5"],
+            "match_details": {},
+            "sources": [],
+        }
+        with patch.object(MODULE, "probe_hardware", return_value=detected):
+            self.assertEqual(
+                MODULE.validate_inputs(catalog, "A5", "mooncake", "ub", "multi-node")[0],
+                "A5",
+            )
+            with self.assertRaisesRegex(MODULE.InputError, "A5 supports only"):
+                MODULE.validate_inputs(catalog, "A5", "mooncake", "roce", "multi-node")
+        with self.assertRaisesRegex(MODULE.InputError, "A3 supports"):
+            MODULE.validate_inputs(catalog, "A3", "mooncake", "ub", "multi-node")
 
     def test_hccs_state_and_topology_parsers(self):
         state_output = """\
@@ -517,6 +639,150 @@ Phy-ID1  SIO     X
         ):
             MODULE.run_hccs_collective(ROOT / "artifacts/hccs_test_a3.py", 2, 1024, 1, 10)
         kill_mock.assert_called_once_with(4321, MODULE.signal.SIGTERM)
+
+    def test_a5_topology_and_port_parsers(self):
+        topology_output = """\
+NPU0 NPU1 NPU2 CPU Affinity
+NPU0 X UB UB 288-383
+NPU1 UB X UB 288-383
+NPU2 UB UB X 96-191
+"""
+        topology = MODULE.parse_a5_topology(topology_output, "UB")
+        self.assertTrue(topology["ok"])
+        self.assertEqual(topology["npu_ids"], [0, 1, 2])
+        self.assertEqual(topology["rows"]["1"], {0: "UB", 1: "X", 2: "UB"})
+
+        port_output = """\
++---------+---------+---------------------+-----------+-------------+------------+
+| UDie ID | Port ID | Speed Ability(Gbps) | Port Type | Link Status | Media Type |
++---------+---------+---------------------+-----------+-------------+------------+
+| 1       | 0       | 400                 | UB        | UP          | Electrical |
+| 1       | 8       | 200                 | ETH       | UP          | Optical    |
++---------+---------+---------------------+-----------+-------------+------------+
+"""
+        ports = MODULE.parse_a5_port_table(port_output)
+        self.assertTrue(ports["ok"])
+        self.assertEqual(ports["rows"][0]["port_type"], "UB")
+        self.assertEqual(ports["rows"][1]["port_type"], "ETH")
+        self.assertTrue(all(row["link_status"] == "UP" for row in ports["rows"]))
+
+    def test_a5_topology_rejects_non_ub_relation(self):
+        output = """\
+NPU0 NPU1
+NPU0 X SYS
+NPU1 UB X
+"""
+        result = MODULE.parse_a5_topology(output, "UB")
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["mismatches"],
+            [{"source": 0, "destination": 1, "relation": "SYS"}],
+        )
+
+    def test_a5_ub_probe_combines_topology_ports_urma_and_peer_ping(self):
+        mapping = """\
+0  0  0  0  Ascend950DT
+1  1  0  1  Ascend950DT
+"""
+        topology = """\
+NPU0 NPU1 CPU Affinity
+NPU0 X UB 288-383
+NPU1 UB X 288-383
+"""
+        ports = """\
+| UDie ID | Port ID | Speed Ability(Gbps) | Port Type | Link Status | Media Type |
+| 1       | 0       | 400                 | UB        | UP          | Electrical |
+"""
+        urma = """\
+0  udmac0d1e2  UB  eid0 0000:0000:003f:0200:0010:0000:df28:0b04  ACTIVE
+"""
+
+        def fake_run(argv, timeout=8):
+            if argv == ["npu-smi", "info", "-m"]:
+                return 0, mapping, ""
+            if argv == ["npu-smi", "info", "-t", "topo"]:
+                return 0, topology, ""
+            if argv[0] == "/usr/bin/hccn_tool":
+                return 0, ports, ""
+            if argv == ["/usr/bin/urma_admin", "show"]:
+                return 0, urma, ""
+            if argv == ["/usr/bin/urma_admin", "show", "topo"]:
+                return 1, "", "Failed to recv netlink msg, ret:-1"
+            if argv[0] == "urma_ping":
+                return 0, "1 transmitted, 1 received, 0% packet loss", ""
+            raise AssertionError(argv)
+
+        context = MODULE.CheckContext(
+            "A5",
+            "mooncake",
+            1024,
+            deployment_mode="multi-node",
+            link_type="ub",
+            peer_eid="0000:0000:0040:0200:0010:0000:df28:1104",
+        )
+        rules = [
+            self.rule("A5-UB-001"),
+            self.rule("A5-URMA-001"),
+            self.rule("A5-PING-001"),
+        ]
+        with (
+            patch.object(MODULE, "run_cmd", side_effect=fake_run),
+            patch.object(MODULE, "find_hccn_tool", return_value="/usr/bin/hccn_tool"),
+            patch.object(
+                MODULE.shutil,
+                "which",
+                side_effect=lambda name: f"/usr/bin/{name}" if name in ("urma_admin", "urma_ping") else None,
+            ),
+        ):
+            result = MODULE.probe_a5_ub(context, rules)
+        self.assertTrue(result["static"]["ok"])
+        self.assertFalse(result["urma"]["ok"])
+        self.assertTrue(result["peer_ping"]["ok"])
+        self.assertEqual(
+            MODULE.evaluate_a5_ub_static(self.rule("A5-UB-001"), {"a5_ub": result})["status"],
+            "PASS",
+        )
+        self.assertEqual(
+            MODULE.evaluate_a5_urma(self.rule("A5-URMA-001"), {"a5_ub": result})["status"],
+            "BLOCK",
+        )
+        self.assertEqual(
+            MODULE.evaluate_a5_peer_ping(self.rule("A5-PING-001"), {"a5_ub": result})["status"],
+            "PASS",
+        )
+
+    def test_a5_urma_and_ping_parsers(self):
+        endpoints = MODULE.parse_urma_endpoints(
+            """\
+0  udmac0d1e2  UB  eid0 0000:0000:003f:0200:0010:0000:df28:0b04  ACTIVE
+1  udmac0d1e3  UB  eid0 0000:0000:003f:0300:0010:0000:df28:0b04  INACTIVE
+"""
+        )
+        self.assertEqual(len(endpoints), 2)
+        self.assertEqual(endpoints[0]["link"], "ACTIVE")
+        ping = MODULE.parse_urma_ping("3 transmitted, 3 received, 0% packet loss, time 2000ms", 0)
+        self.assertTrue(ping["ok"])
+        self.assertEqual(ping["packet_loss_percent"], 0)
+
+    def test_a5_secverify_evaluator_requires_documented_state(self):
+        rule = self.rule("A5-SECVERIFY-001")
+        passing = {
+            "ok": True,
+            "npu_ids": [0, 1],
+            "states": [
+                {"npu_id": 0, "enable": True, "mode": 0},
+                {"npu_id": 1, "enable": True, "mode": 0},
+            ],
+            "errors": [],
+        }
+        self.assertEqual(
+            MODULE.evaluate_a5_secverify(rule, {"a5_secverify": passing})["status"],
+            "PASS",
+        )
+        passing["states"][1]["mode"] = 1
+        result = MODULE.evaluate_a5_secverify(rule, {"a5_secverify": passing})
+        self.assertEqual(result["status"], "BLOCK")
+        self.assertIn("mismatches=1", result["detail"])
 
     def test_roce_ping_result_parses_real_success_output(self):
         output = """\
@@ -771,14 +1037,54 @@ recv seq=2,time=0.102000ms
         self.assertEqual(tool_fallback["evidence"]["satisfied_hccn_entry"], "hccn_tool")
         self.assertIn("HCCN entry point=hccn_tool", tool_fallback["detail"])
 
+    def test_a5_docker_prereqs_require_complete_ub_environment(self):
+        rule = self.rule("A5-DOCKER-001")
+        probe = {
+            "docker": True,
+            "npu_smi": True,
+            "hccn_tool": True,
+            "urma_admin": True,
+            "urma_ping": True,
+            "devices": ["/dev/davinci0"],
+            "davinci_device_count": 8,
+            "davinci_manager": True,
+            "hisi_hdc": True,
+            "driver_dir": True,
+            "ummu_device": True,
+            "uburma_device": True,
+            "hccn_conf": True,
+            "hccl_rootinfo": True,
+            "hixlep_dir": True,
+            "route_conf": True,
+        }
+        passing = MODULE.evaluate_docker_prereqs(rule, {"a5_docker_prereqs": probe})
+        self.assertEqual(passing["status"], "PASS")
+        probe["hccn_tool"] = False
+        failing = MODULE.evaluate_docker_prereqs(rule, {"a5_docker_prereqs": probe})
+        self.assertEqual(failing["status"], "BLOCK")
+        self.assertIn("hccn_tool", failing["detail"])
+        for field in ("davinci_manager", "hisi_hdc", "route_conf"):
+            with self.subTest(field=field):
+                missing = {**probe, "hccn_tool": True, field: False}
+                result = MODULE.evaluate_docker_prereqs(rule, {"a5_docker_prereqs": missing})
+                self.assertEqual(result["status"], "BLOCK")
+                self.assertIn(field, result["detail"])
+
     def test_catalog_contains_only_current_scenarios_and_docker_schema(self):
         rule_ids = {rule["id"] for rule in self.catalog["rules"]}
         self.assertEqual(
             rule_ids,
             {
                 "MEM-001",
+                "MEM-A5-001",
+                "A5-HUGEPAGE-001",
                 "CANN-001",
                 "HDK-001",
+                "A5-DOCKER-001",
+                "A5-SECVERIFY-001",
+                "A5-UB-001",
+                "A5-URMA-001",
+                "A5-PING-001",
                 "KERNEL-001",
                 "LINGQU-001",
                 "HCCS-001",
@@ -790,11 +1096,11 @@ recv seq=2,time=0.102000ms
                 "DEP-MOONCAKE-002",
                 "DEP-MEMCACHE-001",
                 "DEP-MEMCACHE-002",
-                "DEP-MEMCACHE-SSD-001",
                 "SSD-001",
             },
         )
         self.assertEqual(self.catalog["schema_version"], "7.1")
+        self.assertTrue(self.rule("A5-HUGEPAGE-001")["blocking"])
         self.assertEqual(set(self.rule("DOCKER-001")["parameters"]), {"required_all", "required_any"})
 
     def test_memory_evidence_is_compact(self):
@@ -963,11 +1269,37 @@ recv seq=2,time=0.102000ms
 
     def test_cli_supported_ranges_come_from_catalog(self):
         catalog = json.loads(json.dumps(self.catalog))
-        catalog["supported_hardware"].append("A5")
         catalog["supported_backends"].append("openyuanrong")
         help_text = MODULE.build_parser(catalog).format_help()
         self.assertIn("--hardware {A2,A3,A5}", help_text)
         self.assertIn("--backend {memcache,mooncake,openyuanrong}", help_text)
+        self.assertIn("--link-type {roce,hccs,ub}", help_text)
+        self.assertIn("--peer-eid EID", help_text)
+
+    def test_peer_eid_requires_a5_multi_node_ub(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(MODULE, "is_docker_runtime", return_value=True),
+            patch("sys.stderr", stderr),
+        ):
+            rc = MODULE.main(
+                [
+                    "--hardware",
+                    "A3",
+                    "--backend",
+                    "mooncake",
+                    "--managed-memory-mb",
+                    "1024",
+                    "--deployment-mode",
+                    "multi-node",
+                    "--link-type",
+                    "hccs",
+                    "--peer-eid",
+                    "0000:0000:0000:0000:0000:0000:0000:0001",
+                ]
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("--peer-eid requires --hardware A5", stderr.getvalue())
 
     def test_probe_plan_follows_rule_order(self):
         context = MODULE.CheckContext("A3", "memcache", 32768, link_type="hccs")
@@ -990,6 +1322,77 @@ recv seq=2,time=0.102000ms
             ],
         )
 
+    def test_a5_rule_and_probe_plan(self):
+        context = MODULE.CheckContext(
+            "A5",
+            "mooncake",
+            32768,
+            deployment_mode="multi-node",
+            link_type="ub",
+        )
+        rules = [
+            rule
+            for rule in self.catalog["rules"]
+            if MODULE.applies(
+                rule,
+                context.hardware,
+                context.backend,
+                context.link_type,
+                context.deployment_mode,
+            )
+            and MODULE.feature_applies(rule, context.ssd_offload)
+        ]
+        self.assertEqual(
+            {rule["id"] for rule in rules},
+            {
+                "MEM-A5-001",
+                "A5-HUGEPAGE-001",
+                "CANN-001",
+                "HDK-001",
+                "A5-DOCKER-001",
+                "A5-UB-001",
+                "A5-URMA-001",
+                "A5-PING-001",
+                "DEP-MOONCAKE-001",
+                "DEP-MOONCAKE-002",
+            },
+        )
+        self.assertEqual(
+            list(MODULE.build_probe_plan(rules)),
+            [
+                "a5_memory",
+                "a5_hugepages",
+                "hdk",
+                "a5_docker_prereqs",
+                "a5_ub",
+                "package_versions",
+                "glibc",
+            ],
+        )
+        memcache_context = MODULE.CheckContext(
+            "A5",
+            "memcache",
+            32768,
+            deployment_mode="single-node",
+            link_type="ub",
+        )
+        memcache_ids = {
+            rule["id"]
+            for rule in self.catalog["rules"]
+            if MODULE.applies(
+                rule,
+                memcache_context.hardware,
+                memcache_context.backend,
+                memcache_context.link_type,
+                memcache_context.deployment_mode,
+            )
+            and MODULE.feature_applies(rule, False)
+        }
+        self.assertIn("A5-SECVERIFY-001", memcache_ids)
+        self.assertIn("DEP-MEMCACHE-001", memcache_ids)
+        self.assertIn("DEP-MEMCACHE-002", memcache_ids)
+        self.assertNotIn("A5-PING-001", memcache_ids)
+
     def test_package_probe_uses_names_from_applicable_rules(self):
         rules = [
             {"evaluator": "package_version", "parameters": {"package": "package-a"}},
@@ -1008,7 +1411,40 @@ recv seq=2,time=0.102000ms
         self.assertFalse(result["ok"])
         self.assertIn("No SSD Offload storage check strategy is implemented for backend openyuanrong", result["error"])
 
-    def test_memcache_package_rules_are_feature_exclusive(self):
+    def test_memcache_ssd_rejects_block_device_with_partitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            device = Path(directory) / "ssd"
+            device.touch()
+            lsblk = json.dumps(
+                {
+                    "blockdevices": [
+                        {
+                            "path": str(device),
+                            "type": "disk",
+                            "fstype": None,
+                            "mountpoints": [None],
+                            "pkname": None,
+                        },
+                        {
+                            "path": f"{device}1",
+                            "type": "part",
+                            "fstype": None,
+                            "mountpoints": [None],
+                            "pkname": device.name,
+                        },
+                    ]
+                }
+            )
+            with (
+                patch.object(MODULE.Path, "is_block_device", return_value=True),
+                patch.object(MODULE, "run_cmd", return_value=(0, lsblk, "")),
+            ):
+                result = MODULE.probe_ssd_storage(str(device), "memcache")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["partition_count"], 1)
+        self.assertIn("partitions", result["error"])
+
+    def test_memcache_packages_are_required_for_normal_and_ssd_modes(self):
         normal_ids = {
             rule["id"]
             for rule in self.catalog["rules"]
@@ -1020,16 +1456,19 @@ recv seq=2,time=0.102000ms
             if MODULE.applies(rule, "A3", "memcache", "roce", "multi-node") and MODULE.feature_applies(rule, True)
         }
         self.assertIn("DEP-MEMCACHE-002", normal_ids)
-        self.assertNotIn("DEP-MEMCACHE-SSD-001", normal_ids)
-        self.assertNotIn("DEP-MEMCACHE-002", ssd_ids)
-        self.assertIn("DEP-MEMCACHE-SSD-001", ssd_ids)
-
-        result = MODULE.evaluate_package_version(
-            self.rule("DEP-MEMCACHE-SSD-001"),
-            {"package_versions": {"versions": {"memcache-hybrid": None}}},
+        self.assertIn("DEP-MEMCACHE-002", ssd_ids)
+        self.assertEqual(self.rule("DEP-MEMCACHE-001")["parameters"]["threshold"], "1.3.0")
+        self.assertEqual(self.rule("DEP-MEMCACHE-002")["parameters"]["threshold"], "1.3.0")
+        blocked = MODULE.evaluate_package_version(
+            self.rule("DEP-MEMCACHE-002"),
+            {"package_versions": {"versions": {"memcache-hybrid": "1.2.9"}}},
         )
-        self.assertEqual(result["status"], "BLOCK")
-        self.assertTrue(result["blocking"])
+        passed = MODULE.evaluate_package_version(
+            self.rule("DEP-MEMCACHE-002"),
+            {"package_versions": {"versions": {"memcache-hybrid": "1.3.0"}}},
+        )
+        self.assertEqual(blocked["status"], "BLOCK")
+        self.assertEqual(passed["status"], "PASS")
 
     def test_a3_mooncake_package_threshold_depends_on_hdk(self):
         rule = self.rule("DEP-MOONCAKE-001")
