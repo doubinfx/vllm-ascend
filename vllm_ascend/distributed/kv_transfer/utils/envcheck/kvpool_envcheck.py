@@ -27,7 +27,7 @@ import regex as re
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CATALOG = ROOT / "rules.json"
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 RESULT_SCHEMA_VERSION = "13.1"
 REFERENCE_DOCUMENTS = [
     {
@@ -344,6 +344,49 @@ def probe_a5_memory_capacity(managed_memory_mb: int) -> dict[str, Any]:
         "total_memory_mb": total_mb,
         "available_memory_mb": available_mb,
         "failure_kind": failure_kind,
+        "error": error,
+    }
+
+
+def probe_yuanrong_memory_capacity(managed_memory_mb: int) -> dict[str, Any]:
+    """Check free 2MB HugeTLB capacity for Yuanrong shared memory."""
+    meminfo = read_proc_meminfo()
+    page_size_kb = parse_meminfo_number(meminfo.get("Hugepagesize"))
+    total_pages = parse_meminfo_number(meminfo.get("HugePages_Total"))
+    free_pages = parse_meminfo_number(meminfo.get("HugePages_Free"))
+    reserved_pages = parse_meminfo_number(meminfo.get("HugePages_Rsvd"))
+    required_pages = (managed_memory_mb + 1) // 2
+    evidence_complete = total_pages is not None and free_pages is not None and reserved_pages is not None
+    evidence_consistent = False
+    if total_pages is not None and free_pages is not None and reserved_pages is not None:
+        evidence_consistent = 0 <= reserved_pages <= free_pages <= total_pages
+    valid = page_size_kb == 2048 and evidence_consistent
+    available_pages = None
+    if evidence_consistent and free_pages is not None and reserved_pages is not None:
+        available_pages = free_pages - reserved_pages
+    available_memory_mb = available_pages * 2 if valid and available_pages is not None else None
+    ok = bool(valid and available_pages is not None and available_pages >= required_pages)
+    if page_size_kb != 2048:
+        error = "Yuanrong requires 2MB HugeTLB pages"
+    elif not evidence_complete:
+        error = "HugePages_Total, HugePages_Free, and HugePages_Rsvd must all be readable"
+    elif not evidence_consistent:
+        error = "Inconsistent huge-page evidence: Free must not exceed Total and Rsvd must not exceed Free"
+    else:
+        error = None
+    return {
+        "method": "yuanrong_huge_tlb",
+        "ok": ok,
+        "managed_memory_mb": managed_memory_mb,
+        "page_size_kb": page_size_kb,
+        "required_page_size_kb": 2048,
+        "total_pages": total_pages,
+        "free_pages": free_pages,
+        "reserved_pages": reserved_pages,
+        "available_pages": available_pages,
+        "required_pages": required_pages,
+        "available_memory_mb": available_memory_mb,
+        "failure_kind": None if ok else ("capacity" if valid else "capability"),
         "error": error,
     }
 
@@ -1034,6 +1077,47 @@ def probe_package_versions(names: list[str]) -> dict[str, Any]:
     return {"versions": versions}
 
 
+def probe_yuanrong_runtime() -> dict[str, Any]:
+    """Check Yuanrong package metadata, module loading, and dscli availability."""
+    try:
+        package_version = importlib.metadata.version("openyuanrong-datasystem")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = None
+    import_rc, import_output, import_error = run_cmd(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from yr.datasystem.hetero_client import HeteroClient; "
+                "from yr.datasystem.kv_client import ExistenceOpt, SetParam; "
+                "from yr.datasystem.object_client import WriteMode"
+            ),
+        ],
+        timeout=30,
+    )
+    dscli = shutil.which("dscli")
+    dscli_rc = 127
+    dscli_output = ""
+    dscli_error = "dscli is not available"
+    if dscli:
+        dscli_rc, dscli_output, dscli_error = run_cmd([dscli, "--version"], timeout=15)
+    import_text = import_output or import_error
+    import_diagnostic = next(
+        (line.strip() for line in reversed(import_text.splitlines()) if line.strip()),
+        import_text,
+    )
+    return {
+        "package": "openyuanrong-datasystem",
+        "package_version": package_version,
+        "import_rc": import_rc,
+        "import_output": redact(import_diagnostic)[:1000],
+        "dscli": dscli,
+        "dscli_rc": dscli_rc,
+        "dscli_output": redact(dscli_output or dscli_error)[:1000],
+        "ok": package_version is not None and import_rc == 0 and bool(dscli) and dscli_rc == 0,
+    }
+
+
 def probe_ssd_storage(path_text: str, backend: str) -> dict[str, Any]:
     """Check SSD Offload path type, mount state, and availability for the backend."""
     if not path_text:
@@ -1626,6 +1710,8 @@ PROBES: dict[str, Callable[[CheckContext, list[dict[str, Any]]], dict[str, Any]]
     "kernel": lambda context, rules: {**probe_kernel(), "deployment_mode": context.deployment_mode},
     "memory_scan": lambda context, rules: probe_memory_capacity(context.hardware, context.managed_memory_mb),
     "a5_memory": lambda context, rules: probe_a5_memory_capacity(context.managed_memory_mb),
+    "yuanrong_memory": lambda context, rules: probe_yuanrong_memory_capacity(context.managed_memory_mb),
+    "yuanrong_runtime": lambda context, rules: probe_yuanrong_runtime(),
     "a5_hugepages": lambda context, rules: probe_a5_hugepages(),
     "a5_docker_prereqs": lambda context, rules: probe_docker_prereqs(),
     "a5_secverify": lambda context, rules: probe_a5_secverify(),
@@ -2337,6 +2423,55 @@ def evaluate_package_version(rule: dict[str, Any], probes: dict[str, Any]) -> di
     return make_record(rule, status, evidence, f"Detected {name}={version}, required>={threshold}")
 
 
+def evaluate_yuanrong_runtime(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Yuanrong package loading and dscli availability."""
+    probe = probes["yuanrong_runtime"]
+    issues = []
+    if not probe.get("package_version"):
+        issues.append("openyuanrong-datasystem is not installed")
+    if probe.get("import_rc") != 0:
+        issues.append(f"Yuanrong Python modules cannot be imported: {probe.get('import_output') or 'no output'}")
+    if not probe.get("dscli"):
+        issues.append("dscli is not available")
+    elif probe.get("dscli_rc") != 0:
+        issues.append(f"dscli --version failed: {probe.get('dscli_output') or 'no output'}")
+    status = "BLOCK" if issues else "PASS"
+    detail = (
+        f"package={probe.get('package')} version={probe.get('package_version') or '-'}; "
+        f"import_rc={probe.get('import_rc')}; dscli={probe.get('dscli') or '-'}; "
+        f"dscli_rc={probe.get('dscli_rc')}"
+    )
+    if issues:
+        detail += "; " + "; ".join(issues)
+    return make_record(rule, status, probe, detail)
+
+
+def evaluate_yuanrong_memory(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Yuanrong HugeTLB capacity against the shared managed-memory target."""
+    probe = probes["yuanrong_memory"]
+    status = "PASS" if probe.get("ok") else "BLOCK"
+    detail = (
+        f"target={probe.get('managed_memory_mb')}MB; page size={probe.get('page_size_kb') or '-'}kB; "
+        f"free pages={probe.get('free_pages') if probe.get('free_pages') is not None else '-'}; "
+        f"reserved pages={probe.get('reserved_pages') if probe.get('reserved_pages') is not None else '-'}; "
+        f"allocatable pages={probe.get('available_pages') if probe.get('available_pages') is not None else '-'}; "
+        f"required pages={probe.get('required_pages')}; "
+        f"available={probe.get('available_memory_mb') if probe.get('available_memory_mb') is not None else '-'}MB"
+    )
+    if probe.get("error"):
+        detail += f"; error={probe['error']}"
+    result = make_record(rule, status, probe, detail)
+    if status == "BLOCK" and probe.get("failure_kind") == "capacity":
+        result["remediation"]["description"] = (
+            "Increase free 2MB HugeTLB capacity or reduce --managed-memory-mb, then rerun the check."
+        )
+    elif status == "BLOCK":
+        result["remediation"]["description"] = (
+            "Restore readable 2MB HugeTLB evidence in /proc/meminfo, then rerun the check."
+        )
+    return result
+
+
 def evaluate_ssd_storage(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
     """Evaluate Offload storage conditions for the current backend using SSD probe evidence."""
     probe = probes["ssd_storage"]
@@ -2646,6 +2781,8 @@ EVALUATORS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] 
     "docker_prereqs": evaluate_docker_prereqs,
     "manual_confirmation": evaluate_manual_confirmation,
     "package_version": evaluate_package_version,
+    "yuanrong_runtime": evaluate_yuanrong_runtime,
+    "yuanrong_memory": evaluate_yuanrong_memory,
     "ssd_storage": evaluate_ssd_storage,
     "roce_link": evaluate_roce_link,
     "roce_local": evaluate_roce_local,
@@ -2672,6 +2809,8 @@ def build_probe_plan(rules: list[dict[str, Any]]) -> dict[str, list[dict[str, An
 PROBE_LABELS = {
     "memory_scan": "managed memory check",
     "a5_memory": "A5 host memory check",
+    "yuanrong_memory": "Yuanrong HugeTLB capacity check",
+    "yuanrong_runtime": "Yuanrong package check",
     "a5_hugepages": "A5 huge-page check",
     "a5_docker_prereqs": "A5 device and configuration mount check",
     "a5_secverify": "A5 custom-op signature state check",
@@ -3188,6 +3327,10 @@ def build_parser(catalog_data: dict[str, Any]) -> argparse.ArgumentParser:
             "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
             "--hardware A5 --backend mooncake --managed-memory-mb 32768 "
             "--deployment-mode multi-node --link-type ub --peer-eid <remote-eid>\n\n"
+            "  Validate a Yuanrong deployment:\n"
+            "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
+            "--hardware A3 --backend yuanrong --managed-memory-mb 40960 "
+            "--deployment-mode multi-node --link-type hccs\n\n"
             "  Authorize supported local repairs:\n"
             "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
             "--hardware A3 --backend memcache --managed-memory-mb 32768 "
@@ -3342,6 +3485,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise InputError("Check mode requires --managed-memory-mb to be greater than 0")
             if args.ssd_path and not args.ssd_offload:
                 raise InputError("--ssd-path can be used only with --ssd-offload")
+            if args.backend.strip().lower() == "yuanrong" and args.ssd_offload:
+                raise InputError("--ssd-offload is not supported for --backend yuanrong")
             if args.peer_eid and (
                 args.hardware.strip().upper() != "A5"
                 or args.link_type.strip().lower() != "ub"

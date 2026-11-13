@@ -32,8 +32,8 @@ class KvpoolEnvcheckTests(unittest.TestCase):
     def setUpClass(cls):
         cls.catalog = json.loads((ROOT / "rules.json").read_text(encoding="utf-8"))
 
-    def test_tool_version_tracks_a5_support(self):
-        self.assertEqual(MODULE.TOOL_VERSION, "1.1.0")
+    def test_tool_version_tracks_yuanrong_support(self):
+        self.assertEqual(MODULE.TOOL_VERSION, "1.2.0")
 
     def rule(self, rule_id):
         return next(rule for rule in self.catalog["rules"] if rule["id"] == rule_id)
@@ -76,6 +76,8 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             ("A2", "memcache", "25.4.9", "BLOCK"),
             ("A2", "memcache", "25.5.0", "PASS"),
             ("A2", "mooncake", "25.5.0", "PASS"),
+            ("A2", "yuanrong", "25.4.9", "BLOCK"),
+            ("A2", "yuanrong", "25.5.0", "PASS"),
             ("A3", "memcache", "25.4.9", "BLOCK"),
             ("A3", "memcache", "25.5.0", "PASS"),
             ("A3", "memcache", "25.9.9", "PASS"),
@@ -83,9 +85,13 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             ("A3", "mooncake", "25.4.9", "BLOCK"),
             ("A3", "mooncake", "25.5.0", "PASS"),
             ("A3", "mooncake", "26.0.0", "PASS"),
+            ("A3", "yuanrong", "25.4.9", "BLOCK"),
+            ("A3", "yuanrong", "25.5.0", "PASS"),
             ("A5", "memcache", "25.5.9", "BLOCK"),
             ("A5", "memcache", "25.6.0", "PASS"),
             ("A5", "mooncake", "25.6.rc3.1", "PASS"),
+            ("A5", "yuanrong", "25.5.9", "BLOCK"),
+            ("A5", "yuanrong", "25.6.0", "PASS"),
         )
         for hardware, backend, value, expected in cases:
             result = MODULE.evaluate_hdk_requirement(
@@ -245,6 +251,77 @@ class KvpoolEnvcheckTests(unittest.TestCase):
             result = MODULE.probe_a5_memory_capacity(1)
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "capability")
+
+    def test_yuanrong_huge_tlb_uses_managed_memory_target(self):
+        meminfo = {
+            "HugePages_Total": "60000 kB",
+            "HugePages_Free": "51200 kB",
+            "HugePages_Rsvd": "0 kB",
+            "Hugepagesize": "2048 kB",
+        }
+        with patch.object(MODULE, "read_proc_meminfo", return_value=meminfo):
+            result = MODULE.probe_yuanrong_memory_capacity(102400)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["required_pages"], 51200)
+        self.assertEqual(result["available_memory_mb"], 102400)
+        record = MODULE.evaluate_yuanrong_memory(self.rule("YUANRONG-MEM-001"), {"yuanrong_memory": result})
+        self.assertEqual(record["status"], "PASS")
+        self.assertIn("target=102400MB", record["detail"])
+
+    def test_yuanrong_huge_tlb_rejects_shortage_and_non_two_mb_pages(self):
+        shortage = {
+            "HugePages_Total": "60000 kB",
+            "HugePages_Free": "50000 kB",
+            "HugePages_Rsvd": "0 kB",
+            "Hugepagesize": "2048 kB",
+        }
+        with patch.object(MODULE, "read_proc_meminfo", return_value=shortage):
+            result = MODULE.probe_yuanrong_memory_capacity(102400)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "capacity")
+        record = MODULE.evaluate_yuanrong_memory(self.rule("YUANRONG-MEM-001"), {"yuanrong_memory": result})
+        self.assertEqual(record["status"], "BLOCK")
+        self.assertIn("reduce --managed-memory-mb", record["remediation"]["description"])
+
+        non_two_mb = {**shortage, "Hugepagesize": "1048576 kB"}
+        with patch.object(MODULE, "read_proc_meminfo", return_value=non_two_mb):
+            result = MODULE.probe_yuanrong_memory_capacity(2)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "capability")
+
+    def test_yuanrong_runtime_requires_package_import_and_dscli(self):
+        def passing_run(argv, timeout=8):
+            if argv[0] == MODULE.sys.executable:
+                return 0, "", ""
+            if argv[0] == "/usr/bin/dscli":
+                return 0, "dscli 0.4.0\n", ""
+            raise AssertionError(argv)
+
+        with (
+            patch.object(MODULE.importlib.metadata, "version", return_value="0.4.0"),
+            patch.object(MODULE.shutil, "which", return_value="/usr/bin/dscli"),
+            patch.object(MODULE, "run_cmd", side_effect=passing_run),
+        ):
+            probe = MODULE.probe_yuanrong_runtime()
+        self.assertTrue(probe["ok"])
+        result = MODULE.evaluate_yuanrong_runtime(self.rule("DEP-YUANRONG-001"), {"yuanrong_runtime": probe})
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("version=0.4.0", result["detail"])
+
+        failed = {
+            "package": "openyuanrong-datasystem",
+            "package_version": None,
+            "import_rc": 1,
+            "import_output": "No module named yr",
+            "dscli": None,
+            "dscli_rc": 127,
+            "dscli_output": "dscli is not available",
+            "ok": False,
+        }
+        result = MODULE.evaluate_yuanrong_runtime(self.rule("DEP-YUANRONG-001"), {"yuanrong_runtime": failed})
+        self.assertEqual(result["status"], "BLOCK")
+        self.assertIn("openyuanrong-datasystem is not installed", result["detail"])
+        self.assertIn("dscli is not available", result["detail"])
 
     def test_a5_hugepages_warn_and_fix(self):
         rule = self.rule("A5-HUGEPAGE-001")
@@ -1077,6 +1154,7 @@ recv seq=2,time=0.102000ms
             {
                 "MEM-001",
                 "MEM-A5-001",
+                "YUANRONG-MEM-001",
                 "A5-HUGEPAGE-001",
                 "CANN-001",
                 "HDK-001",
@@ -1092,6 +1170,7 @@ recv seq=2,time=0.102000ms
                 "ROCE-001",
                 "ROCE-002",
                 "DOCKER-001",
+                "DEP-YUANRONG-001",
                 "DEP-MOONCAKE-001",
                 "DEP-MOONCAKE-002",
                 "DEP-MEMCACHE-001",
@@ -1269,12 +1348,35 @@ recv seq=2,time=0.102000ms
 
     def test_cli_supported_ranges_come_from_catalog(self):
         catalog = json.loads(json.dumps(self.catalog))
-        catalog["supported_backends"].append("openyuanrong")
         help_text = MODULE.build_parser(catalog).format_help()
         self.assertIn("--hardware {A2,A3,A5}", help_text)
-        self.assertIn("--backend {memcache,mooncake,openyuanrong}", help_text)
+        self.assertIn("--backend {memcache,mooncake,yuanrong}", help_text)
         self.assertIn("--link-type {roce,hccs,ub}", help_text)
         self.assertIn("--peer-eid EID", help_text)
+
+    def test_yuanrong_rejects_ssd_offload(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(MODULE, "is_docker_runtime", return_value=True),
+            patch("sys.stderr", stderr),
+        ):
+            rc = MODULE.main(
+                [
+                    "--hardware",
+                    "A3",
+                    "--backend",
+                    "yuanrong",
+                    "--managed-memory-mb",
+                    "32768",
+                    "--deployment-mode",
+                    "single-node",
+                    "--link-type",
+                    "hccs",
+                    "--ssd-offload",
+                ]
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("--ssd-offload is not supported for --backend yuanrong", stderr.getvalue())
 
     def test_peer_eid_requires_a5_multi_node_ub(self):
         stderr = io.StringIO()
@@ -1393,6 +1495,52 @@ recv seq=2,time=0.102000ms
         self.assertIn("DEP-MEMCACHE-002", memcache_ids)
         self.assertNotIn("A5-PING-001", memcache_ids)
 
+    def test_yuanrong_rule_applicability_across_hardware(self):
+        cases = {
+            ("A2", "roce", "multi-node"): {
+                "YUANRONG-MEM-001",
+                "CANN-001",
+                "HDK-001",
+                "ROCE-001",
+                "ROCE-002",
+                "DOCKER-001",
+                "DEP-YUANRONG-001",
+            },
+            ("A3", "hccs", "multi-node"): {
+                "YUANRONG-MEM-001",
+                "CANN-001",
+                "HDK-001",
+                "HCCS-001",
+                "HCCS-002",
+                "DOCKER-001",
+                "DEP-YUANRONG-001",
+            },
+            ("A5", "ub", "multi-node"): {
+                "YUANRONG-MEM-001",
+                "CANN-001",
+                "HDK-001",
+                "A5-DOCKER-001",
+                "A5-UB-001",
+                "A5-URMA-001",
+                "A5-PING-001",
+                "DEP-YUANRONG-001",
+            },
+        }
+        for (hardware, link_type, deployment_mode), expected in cases.items():
+            with self.subTest(hardware=hardware, link_type=link_type):
+                rule_ids = {
+                    rule["id"]
+                    for rule in self.catalog["rules"]
+                    if MODULE.applies(rule, hardware, "yuanrong", link_type, deployment_mode)
+                    and MODULE.feature_applies(rule, False)
+                }
+                self.assertTrue(expected <= rule_ids)
+                self.assertNotIn("A5-SECVERIFY-001", rule_ids)
+                self.assertNotIn("A5-HUGEPAGE-001", rule_ids)
+                self.assertNotIn("SSD-001", rule_ids)
+                self.assertNotIn("DEP-MOONCAKE-001", rule_ids)
+                self.assertNotIn("DEP-MEMCACHE-001", rule_ids)
+
     def test_package_probe_uses_names_from_applicable_rules(self):
         rules = [
             {"evaluator": "package_version", "parameters": {"package": "package-a"}},
@@ -1407,9 +1555,9 @@ recv seq=2,time=0.102000ms
 
     def test_ssd_unknown_backend_does_not_fall_back_to_mooncake(self):
         with tempfile.TemporaryDirectory() as directory:
-            result = MODULE.probe_ssd_storage(directory, "openyuanrong")
+            result = MODULE.probe_ssd_storage(directory, "yuanrong")
         self.assertFalse(result["ok"])
-        self.assertIn("No SSD Offload storage check strategy is implemented for backend openyuanrong", result["error"])
+        self.assertIn("No SSD Offload storage check strategy is implemented for backend yuanrong", result["error"])
 
     def test_memcache_ssd_rejects_block_device_with_partitions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1497,15 +1645,17 @@ recv seq=2,time=0.102000ms
         self.assertIsNone(new_hdk["evidence"]["required_version"])
         self.assertEqual(new_hdk["evidence"]["threshold_exception"]["minimum_hdk"], "26.0.0")
 
-        unchanged = MODULE.evaluate_package_version(
-            rule,
-            {
-                **package_versions,
-                "hdk": {"hardware": "A2", "backend": "mooncake", "version": "26.0.0"},
-            },
-        )
-        self.assertEqual(unchanged["status"], "BLOCK")
-        self.assertEqual(unchanged["evidence"]["required_version"], "0.3.11.post1")
+        for hardware in ("A2", "A5"):
+            with self.subTest(hardware=hardware):
+                unchanged = MODULE.evaluate_package_version(
+                    rule,
+                    {
+                        **package_versions,
+                        "hdk": {"hardware": hardware, "backend": "mooncake", "version": "26.0.0"},
+                    },
+                )
+                self.assertEqual(unchanged["status"], "BLOCK")
+                self.assertEqual(unchanged["evidence"]["required_version"], "0.3.11.post1")
 
     def test_output_bundle_uses_one_run_id_for_result_and_report(self):
         result = MODULE.make_record(self.rule("DOCKER-001"), "PASS", {}, "test")

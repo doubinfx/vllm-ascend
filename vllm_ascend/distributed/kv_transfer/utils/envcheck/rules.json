@@ -1,7 +1,7 @@
 {
   "schema_version": "7.1",
   "supported_hardware": ["A2", "A3", "A5"],
-  "supported_backends": ["memcache", "mooncake"],
+  "supported_backends": ["memcache", "mooncake", "yuanrong"],
   "supported_link_types": ["roce", "hccs", "ub"],
   "supported_deployment_modes": ["single-node", "multi-node"],
   "hardware_identification": {
@@ -47,6 +47,20 @@
       "remediation": {"type": "manual_host_memory", "description": "Reduce the configured backend memory target or release host memory, then rerun the check.", "requires_root": true, "requires_reboot": false}
     },
     {
+      "id": "YUANRONG-MEM-001",
+      "problem": "Yuanrong 2MB HugeTLB capacity is insufficient for the managed-memory target",
+      "impact": "The Yuanrong Datasystem shared-memory backend cannot reserve the requested KV Pool capacity.",
+      "hardware": ["A2", "A3", "A5"],
+      "backends": ["yuanrong"],
+      "scope": "docker",
+      "blocking": true,
+      "probe": "yuanrong_memory",
+      "evaluator": "yuanrong_memory",
+      "parameters": {"required_page_size_kb": 2048},
+      "evidence_method": "Read HugePages_Total, HugePages_Free, HugePages_Rsvd, and Hugepagesize from /proc/meminfo, then compare allocatable 2MB HugeTLB capacity with --managed-memory-mb.",
+      "remediation": {"type": "manual_yuanrong_memory", "description": "Increase free 2MB HugeTLB capacity or reduce the managed-memory target, then rerun the check.", "requires_root": true, "requires_reboot": false}
+    },
+    {
       "id": "A5-HUGEPAGE-001",
       "problem": "A5 residual huge pages can reduce KV Pool performance",
       "impact": "Residual 1GB or 2MB huge pages can degrade Mooncake and Memcache performance.",
@@ -65,7 +79,7 @@
       "problem": "CANN version is lower than 9.1.0",
       "impact": "Required pooled-memory semantic features are unavailable, so KV Pool cannot be used.",
       "hardware": ["A2", "A3", "A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "probe": "hdk",
@@ -79,7 +93,7 @@
       "problem": "HDK version does not meet the requirement for the current hardware and backend",
       "impact": "The HDK version is lower than the minimum required by the current hardware and backend, which may reduce managed-memory availability or prevent KV Pool initialization.",
       "hardware": ["A2", "A3", "A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "probe": "hdk",
@@ -88,10 +102,13 @@
         "requirements": [
           {"hardware": "A2", "backend": "memcache", "minimum": "25.5.0"},
           {"hardware": "A2", "backend": "mooncake", "minimum": "25.5.0"},
+          {"hardware": "A2", "backend": "yuanrong", "minimum": "25.5.0"},
           {"hardware": "A3", "backend": "memcache", "minimum": "25.5.0"},
           {"hardware": "A3", "backend": "mooncake", "minimum": "25.5.0"},
+          {"hardware": "A3", "backend": "yuanrong", "minimum": "25.5.0"},
           {"hardware": "A5", "backend": "memcache", "minimum": "25.6.0"},
-          {"hardware": "A5", "backend": "mooncake", "minimum": "25.6.0"}
+          {"hardware": "A5", "backend": "mooncake", "minimum": "25.6.0"},
+          {"hardware": "A5", "backend": "yuanrong", "minimum": "25.6.0"}
         ],
         "unknown_status": "BLOCK"
       },
@@ -103,7 +120,7 @@
       "problem": "A5 devices or UB configuration paths are not exposed in Docker",
       "impact": "The container cannot access the A5 UB/UBOE runtime or its required configuration.",
       "hardware": ["A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "probe": "a5_docker_prereqs",
@@ -133,7 +150,7 @@
       "problem": "A5 NPU topology or physical UB ports are not ready",
       "impact": "The A5 node cannot provide the expected UB data path for KV Pool.",
       "hardware": ["A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["ub"],
@@ -149,7 +166,7 @@
       "problem": "A5 URMA endpoints or fabric topology are unavailable",
       "impact": "A5 UB/UBOE communication cannot be validated.",
       "hardware": ["A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["ub"],
@@ -165,7 +182,7 @@
       "problem": "A5 cross-node URMA connectivity failed",
       "impact": "Remote KV Pool data transfer may be unavailable.",
       "hardware": ["A5"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": false,
       "link_types": ["ub"],
@@ -212,7 +229,7 @@
       "problem": "Intra-node SIO/HCCS links on A3 are not ready",
       "impact": "Basic die-to-die interconnect inside the A3 node is unavailable.",
       "hardware": ["A3"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["hccs"],
@@ -228,7 +245,7 @@
       "problem": "Intra-node cross-chip communication on A3 is abnormal",
       "impact": "HCCL data exchange inside the A3 node is unreliable.",
       "hardware": ["A3"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["hccs"],
@@ -244,7 +261,7 @@
       "problem": "NPU RoCE port is not ready",
       "impact": "The corresponding NPU RoCE port is unavailable.",
       "hardware": ["A2", "A3"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["roce"],
@@ -260,7 +277,7 @@
       "problem": "Local NPU-to-NPU RoCE data path is abnormal",
       "impact": "RoCE data transfer between NPUs on the current host is unreliable.",
       "hardware": ["A2", "A3"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "link_types": ["roce"],
@@ -276,7 +293,7 @@
       "problem": "Docker does not expose the Ascend devices, driver, or HCCN entry point",
       "impact": "The container cannot access the NPU, driver, or an available HCCN entry point, so KV Pool cannot initialize correctly.",
       "hardware": ["A2", "A3"],
-      "backends": ["memcache", "mooncake"],
+      "backends": ["memcache", "mooncake", "yuanrong"],
       "scope": "docker",
       "blocking": true,
       "probe": "docker_prereqs",
@@ -287,6 +304,20 @@
       },
       "evidence_method": "Check the Docker marker, npu-smi, /dev/davinci*, /usr/local/Ascend/driver, and confirm that at least one of /etc/hccn.conf or an executable hccn_tool is available.",
       "remediation": {"type": "manual_container_recreate", "description": "Recreate the container with Ascend devices and driver directories exposed. Mount /etc/hccn.conf or ensure hccn_tool is executable, then rerun the check.", "requires_root": true, "requires_reboot": false}
+    },
+    {
+      "id": "DEP-YUANRONG-001",
+      "problem": "openyuanrong-datasystem or dscli is unavailable",
+      "impact": "The Yuanrong backend cannot load its Python client or start Datasystem services.",
+      "hardware": ["A2", "A3", "A5"],
+      "backends": ["yuanrong"],
+      "scope": "docker",
+      "blocking": true,
+      "probe": "yuanrong_runtime",
+      "evaluator": "yuanrong_runtime",
+      "parameters": {"package": "openyuanrong-datasystem"},
+      "evidence_method": "Read the openyuanrong-datasystem package version, import the Yuanrong client modules used by vLLM-Ascend, and run dscli --version.",
+      "remediation": {"type": "manual_offline_image_update", "description": "Bake a compatible openyuanrong-datasystem package and dscli into the image, recreate the container, and rerun the check.", "requires_root": false, "requires_reboot": false}
     },
     {
       "id": "DEP-MOONCAKE-001",
@@ -306,7 +337,7 @@
         ]
       },
       "evidence_method": "Read the mooncake-transfer-engine-npu version from Python package metadata and apply the A3 HDK-dependent minimum version.",
-      "remediation": {"type": "manual_offline_image_update", "description": "Install mooncake-transfer-engine-npu. A3 with HDK 26.0.0 or newer has no minimum package version; A2 and A3 with HDK 25.5.0 require 0.3.11.post1 or newer.", "requires_root": false, "requires_reboot": false}
+      "remediation": {"type": "manual_offline_image_update", "description": "Install mooncake-transfer-engine-npu. A3 with HDK 26.0.0 or newer has no minimum package version; other supported combinations require 0.3.11.post1 or newer.", "requires_root": false, "requires_reboot": false}
     },
     {
       "id": "DEP-MOONCAKE-002",
