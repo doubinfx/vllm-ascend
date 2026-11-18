@@ -1,4 +1,4 @@
-# vLLM-Ascend KV Pool Environment Checker v1.1.0
+# vLLM-Ascend KV Pool Environment Checker v1.2.0
 
 This tool performs pre-deployment environment checks for vLLM-Ascend KV Pool deployments. It identifies dependency issues, reports blocking conditions and remediation guidance, and executes supported local repairs only after explicit authorization.
 
@@ -66,7 +66,7 @@ Run `python examples/kvpool_envcheck/kvpool_envcheck.py -h` to view complete hel
 | Parameter | Description |
 |---|---|
 | `--hardware` | Hardware platform. Currently supports A2, A3, and 950PR&950DT Products, and must match the hardware detected in the current container |
-| `--backend` | KV Pool backend. Currently supports `memcache` and `mooncake` |
+| `--backend` | KV Pool backend. Currently supports `memcache`, `mooncake`, and `yuanrong` |
 | `--managed-memory-mb MB` | Total backend-managed memory in MB. Must be greater than 0 and is compared against the hardware-specific capacity |
 | `--deployment-mode` | `single-node` or `multi-node` |
 | `--link-type` | `roce`, `hccs`, or `ub`. A2 supports only `roce`; A3 supports `roce` and `hccs`; 950PR&950DT Products support only `ub` |
@@ -81,7 +81,9 @@ Configuration constraints:
 - A3 Mooncake requires HDK `>=25.5.0` with Mooncake `>=0.3.11.post1`, or HDK `>=26.0.0` with no minimum Mooncake version. A2 Mooncake requires Mooncake `>=0.3.11.post1`.
 - 950PR&950DT Products use the `ub` link type. The checker validates the NPU `UB` topology, physical UB/UBOE ports, active URMA endpoints, and 950PR&950DT Products-specific container paths.
 - 950PR&950DT Products host memory uses `MemAvailable`. The requested target must not exceed it.
-- 950PR&950DT Products residual 1 GB and 2 MB huge pages produce a performance warning. Explicit `--fix` clears these pools and rechecks them.
+- For Memcache and Mooncake, 950PR&950DT Products residual 1 GB and 2 MB huge pages produce a performance warning. Explicit `--fix` clears these pools and rechecks them.
+- Yuanrong uses `--managed-memory-mb` as the capacity target for its 2 MB HugeTLB requirement.
+- On A2, all supported backends require HDK `>=25.5.0`. On A3, Memcache and Yuanrong require HDK `>=25.5.0`; Mooncake requires HDK `>=25.5.0` with Mooncake `>=0.3.11.post1`, or HDK `>=26.0.0` with no minimum Mooncake version. On 950PR&950DT Products, all supported backends require HDK `>=25.6.0`.
 - Launch environment variables are not checked; configure them in the actual vLLM launch environment.
 - `KERNEL-001` applies only to multi-node deployments. Single-node deployments return `NOT_APPLICABLE` and are not blocked by this rule.
 - The `--hardware` value must be supported and must exactly match the detected hardware.
@@ -113,9 +115,30 @@ The container must expose:
 
 Mooncake supports two A3 HDK paths: HDK `>=26.0.0` with any installed `mooncake-transfer-engine-npu` version, or HDK `>=25.5.0` with `mooncake-transfer-engine-npu >=0.3.11.post1`. A2 and 950PR&950DT Products require `mooncake-transfer-engine-npu >=0.3.11.post1`. All Mooncake deployments require glibc `>=2.35`. Memcache requires both `memfabric-hybrid >=1.3.0` and `memcache-hybrid >=1.3.0`.
 
+### Yuanrong checks
+
+Yuanrong requires the `openyuanrong-datasystem` Python package to be installed and loadable, and `dscli --version` must succeed:
+
+```bash
+python kvpool_envcheck.py \
+  --hardware A3 \
+  --backend yuanrong \
+  --managed-memory-mb 40960 \
+  --deployment-mode multi-node \
+  --link-type hccs
+```
+
+The checker validates 2 MB HugeTLB capacity as:
+
+```text
+(HugePages_Free - HugePages_Rsvd) * 2 MB >= managed-memory-mb
+```
+
+It does not parse `yuanrong.json`, inspect launch environment variables, or validate an already running Datasystem service. SSD Offload is not supported for Yuanrong and `--ssd-offload` is rejected.
+
 ## SSD Offload
 
-Enabling SSD checks requires `--ssd-path`:
+SSD Offload checks are available for Memcache and Mooncake. Enabling them requires `--ssd-path`:
 
 ```bash
 python examples/kvpool_envcheck/kvpool_envcheck.py \
