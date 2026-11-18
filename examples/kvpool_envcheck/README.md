@@ -1,0 +1,227 @@
+# vLLM-Ascend KV Pool Environment Checker v1.2.0
+
+This tool performs pre-deployment environment checks for vLLM-Ascend KV Pool deployments. It identifies dependency issues, reports blocking conditions and remediation guidance, and executes supported local repairs only after explicit authorization.
+
+The tool runs only inside a vLLM-Ascend Docker container. It operates offline and is read-only by default. The `rules.json` file in this directory is the source of truth for rules and supported configurations.
+
+The directory also contains the runtime artifacts `artifacts/mem_scan.py` and `artifacts/hccs_test_a3.py`, plus the source manifest `artifacts/manifest.json`.
+
+## Invocation
+
+### Run from a standalone directory
+
+Run the following command from the vLLM-Ascend repository root:
+
+```bash
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --hardware A3 \
+  --backend memcache \
+  --managed-memory-mb 32768 \
+  --deployment-mode single-node \
+  --link-type hccs
+```
+
+You can also copy the complete `examples/kvpool_envcheck` directory to any location and run `python kvpool_envcheck.py` from that directory. Standalone use requires both `rules.json` and `artifacts/`.
+
+## Quick start
+
+### Print the report
+
+```bash
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --hardware A3 \
+  --backend memcache \
+  --managed-memory-mb 32768 \
+  --deployment-mode single-node \
+  --link-type hccs
+```
+
+This mode does not create files. The report is written to standard output, and progress is written to standard error.
+
+### Save the results
+
+```bash
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --hardware A3 \
+  --backend memcache \
+  --managed-memory-mb 32768 \
+  --deployment-mode multi-node \
+  --link-type hccs \
+  --output-dir ./results
+```
+
+Each run creates a pair of files with the same `run_id`:
+
+| File | Purpose |
+|---|---|
+| `kvpool_envcheck_<run_id>.result.json` | Complete machine-readable result, raw evidence, repair actions, and reference documents |
+| `kvpool_envcheck_<run_id>.report.txt` | Human-readable environment report highlighting conclusions, blockers, and recommendations |
+
+When `--output-dir` is omitted, no files are created. When it is specified, standard output contains only the final conclusion, `run_id`, and output paths.
+
+## Parameters and combinations
+
+Run `python examples/kvpool_envcheck/kvpool_envcheck.py -h` to view complete help generated from the current rule catalog. Check mode requires all of the following parameters:
+
+| Parameter | Description |
+|---|---|
+| `--hardware` | Hardware platform. Currently supports A2, A3, and A5, and must match the hardware detected in the current container |
+| `--backend` | KV Pool backend. Currently supports `memcache`, `mooncake`, and `yuanrong` |
+| `--managed-memory-mb MB` | Total backend-managed memory in MB. Must be greater than 0 and is compared against the hardware-specific capacity |
+| `--deployment-mode` | `single-node` or `multi-node` |
+| `--link-type` | `roce`, `hccs`, or `ub`. A2 supports only `roce`; A3 supports `roce` and `hccs`; A5 supports only `ub` |
+| `--peer-eid EID` | Optional A5 multi-node peer EID for `urma_ping`; requires A5, `ub`, and `multi-node` |
+
+Configuration constraints:
+
+- A2 supports RoCE checks only.
+- On A2, static huge-page capacity is the unreserved allocatable capacity: `(HugePages_Free - HugePages_Rsvd) * Hugepagesize`. Missing or inconsistent reservation evidence blocks the check.
+- A3 with `roce` runs static RoCE port checks and dynamic local NPU-to-NPU checks.
+- A3 with `hccs` runs static and dynamic intra-node SIO/HCCS checks. Multi-node deployments also require manual confirmation of the Lingqu CC version.
+- A3 Mooncake requires HDK `>=25.5.0` with Mooncake `>=0.3.11.post1`, or HDK `>=26.0.0` with no minimum Mooncake version. A2 Mooncake requires Mooncake `>=0.3.11.post1`.
+- A5 uses the `ub` link type. The checker validates the NPU `UB` topology, physical UB/UBOE ports, URMA endpoints, `urma_admin show topo`, and A5-specific container paths.
+- A5 host memory uses `MemAvailable`. The requested target must not exceed it.
+- For Memcache and Mooncake, A5 residual 1 GB and 2 MB huge pages produce a performance warning. Explicit `--fix` clears these pools and rechecks them.
+- Yuanrong uses `--managed-memory-mb` as the capacity target for its 2 MB HugeTLB requirement.
+- On A2, all supported backends require HDK `>=25.5.0`. On A3, Memcache and Yuanrong require HDK `>=25.5.0`; Mooncake requires HDK `>=25.5.0` with Mooncake `>=0.3.11.post1`, or HDK `>=26.0.0` with no minimum Mooncake version. On A5, all supported backends require HDK `>=25.6.0`.
+- Launch environment variables are not checked; configure them in the actual vLLM launch environment.
+- `KERNEL-001` applies only to multi-node deployments. Single-node deployments return `NOT_APPLICABLE` and are not blocked by this rule.
+- The `--hardware` value must be supported and must exactly match the detected hardware.
+
+### A5 checks
+
+The A5 path is intended for Ascend 950PR/950DT Products:
+
+```bash
+python kvpool_envcheck.py \
+  --hardware A5 \
+  --backend mooncake \
+  --managed-memory-mb 32768 \
+  --deployment-mode multi-node \
+  --link-type ub \
+  --peer-eid <remote-eid>
+```
+
+The container must expose:
+
+- `/dev/davinci*`, `/dev/davinci_manager`, and `/dev/hisi_hdc`
+- `/dev/ummu` and `/dev/uburma`
+- `npu-smi`, `hccn_tool`, `urma_admin`, and optionally `urma_ping`
+- `/usr/local/Ascend/driver`
+- `/etc/hccn.conf`, `/etc/hccl_rootinfo.json`, and `/etc/hixlep`
+- `/lib/route.conf`
+
+`--peer-eid` is optional. Without it, cross-node `urma_ping` is reported as `NOT_EXECUTED`; local UB and URMA topology checks still run. An actual multi-node preflight should provide the remote ACTIVE EID.
+
+Mooncake supports two A3 HDK paths: HDK `>=26.0.0` with any installed `mooncake-transfer-engine-npu` version, or HDK `>=25.5.0` with `mooncake-transfer-engine-npu >=0.3.11.post1`. A2 and A5 require `mooncake-transfer-engine-npu >=0.3.11.post1`. All Mooncake deployments require glibc `>=2.35`. Memcache requires both `memfabric-hybrid >=1.3.0` and `memcache-hybrid >=1.3.0`.
+
+### Yuanrong checks
+
+Yuanrong requires the `openyuanrong-datasystem` Python package to be installed and loadable, and `dscli --version` must succeed:
+
+```bash
+python kvpool_envcheck.py \
+  --hardware A3 \
+  --backend yuanrong \
+  --managed-memory-mb 40960 \
+  --deployment-mode multi-node \
+  --link-type hccs
+```
+
+The checker validates 2 MB HugeTLB capacity as:
+
+```text
+(HugePages_Free - HugePages_Rsvd) * 2 MB >= managed-memory-mb
+```
+
+It does not parse `yuanrong.json`, inspect launch environment variables, or validate an already running Datasystem service. SSD Offload is not supported for Yuanrong and `--ssd-offload` is rejected.
+
+## SSD Offload
+
+SSD Offload checks are available for Memcache and Mooncake. Enabling them requires `--ssd-path`:
+
+```bash
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --hardware A3 \
+  --backend memcache \
+  --managed-memory-mb 32768 \
+  --deployment-mode multi-node \
+  --link-type hccs \
+  --ssd-offload \
+  --ssd-path /dev/nvme1n1 \
+  --output-dir ./results
+```
+
+- For `memcache`, `--ssd-path` must be an unmounted dedicated block device, partition, or loop device without a filesystem signature. A directory is not accepted.
+- For `mooncake`, `--ssd-path` may be a writable directory or block device with sufficient free space.
+- When `--ssd-offload` is omitted, SSD dependency rules do not participate in the check.
+
+## Repair authorization
+
+`--fix` explicitly authorizes the tool to execute supported local repairs:
+
+```bash
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --hardware A3 \
+  --backend memcache \
+  --managed-memory-mb 32768 \
+  --deployment-mode multi-node \
+  --link-type hccs \
+  --fix \
+  --output-dir ./results
+```
+
+Currently, `MEM-001` on A3 supports cache-drop repair, and `A5-HUGEPAGE-001` supports clearing residual A5 1 GB and 2 MB huge pages. Both actions require root privileges and an explicit `--fix`. A5 security-signature settings are never changed automatically.
+
+The tool does not drop caches when A2 static huge pages are insufficient. It also does not automatically upgrade HDK, CANN, the kernel, network devices, container mounts, security settings, or software packages. The result includes manual remediation guidance for these cases. Repair action states are `SUCCESS`, `NO_EFFECT`, `FAILED`, `SKIPPED`, and `MANUAL`.
+
+## Output states and exit codes
+
+An individual scenario can return:
+
+- `PASS`: the issue was not detected.
+- `BLOCK`: a blocking issue was detected.
+- `WARN`: a risk was detected and requires confirmation.
+- `MANUAL_REQUIRED`: manual confirmation is required.
+- `NOT_APPLICABLE`: the current hardware, backend, or deployment mode is not applicable.
+- `NOT_EXECUTED`: the check was not executed because prerequisites were not met.
+
+Process exit codes:
+
+| Exit code | Meaning |
+|---:|---|
+| `0` | Checks passed |
+| `10` | Warnings or manual confirmations are present |
+| `20` | Blocking issues are present |
+| `2` | Input, rule, or output error |
+
+Real-time progress uses `--progress auto` by default. Progress is displayed in interactive terminals and disabled for non-interactive invocations. It can also be selected explicitly:
+
+```bash
+--progress always   # Always display progress
+--progress never    # Disable progress
+```
+
+Progress is written only to standard error and does not mix with TEXT or JSON results. Each check stage reports only its start, completion, and elapsed time.
+
+## Rule maintenance
+
+`rules.json` is the single runtime source of truth for scenarios, applicability, evaluation methods, and remediation guidance. Supported configurations are reflected automatically in `-h` output, and this README does not duplicate the rule list.
+
+```bash
+# Validate the rule catalog
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --validate-catalog
+
+# List all scenarios
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --list-rules
+
+# Describe one scenario
+python examples/kvpool_envcheck/kvpool_envcheck.py \
+  --describe-rule MEM-001
+```
+
+## References
+
+The `reference_documents` section of the result records the official [vLLM-Ascend KV Cache Pool User Guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md), including its source commit and review date. The tool does not access the network at runtime.
