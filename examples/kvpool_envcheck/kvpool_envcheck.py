@@ -27,7 +27,7 @@ import regex as re
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CATALOG = ROOT / "rules.json"
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 RESULT_SCHEMA_VERSION = "13.1"
 REFERENCE_DOCUMENTS = [
     {
@@ -348,6 +348,49 @@ def probe_a5_memory_capacity(managed_memory_mb: int) -> dict[str, Any]:
     }
 
 
+def probe_yuanrong_memory_capacity(managed_memory_mb: int) -> dict[str, Any]:
+    """Check free 2MB HugeTLB capacity for Yuanrong shared memory."""
+    meminfo = read_proc_meminfo()
+    page_size_kb = parse_meminfo_number(meminfo.get("Hugepagesize"))
+    total_pages = parse_meminfo_number(meminfo.get("HugePages_Total"))
+    free_pages = parse_meminfo_number(meminfo.get("HugePages_Free"))
+    reserved_pages = parse_meminfo_number(meminfo.get("HugePages_Rsvd"))
+    required_pages = (managed_memory_mb + 1) // 2
+    evidence_complete = total_pages is not None and free_pages is not None and reserved_pages is not None
+    evidence_consistent = False
+    if total_pages is not None and free_pages is not None and reserved_pages is not None:
+        evidence_consistent = 0 <= reserved_pages <= free_pages <= total_pages
+    valid = page_size_kb == 2048 and evidence_consistent
+    available_pages = None
+    if evidence_consistent and free_pages is not None and reserved_pages is not None:
+        available_pages = free_pages - reserved_pages
+    available_memory_mb = available_pages * 2 if valid and available_pages is not None else None
+    ok = bool(valid and available_pages is not None and available_pages >= required_pages)
+    if page_size_kb != 2048:
+        error = "Yuanrong requires 2MB HugeTLB pages"
+    elif not evidence_complete:
+        error = "HugePages_Total, HugePages_Free, and HugePages_Rsvd must all be readable"
+    elif not evidence_consistent:
+        error = "Inconsistent huge-page evidence: Free must not exceed Total and Rsvd must not exceed Free"
+    else:
+        error = None
+    return {
+        "method": "yuanrong_huge_tlb",
+        "ok": ok,
+        "managed_memory_mb": managed_memory_mb,
+        "page_size_kb": page_size_kb,
+        "required_page_size_kb": 2048,
+        "total_pages": total_pages,
+        "free_pages": free_pages,
+        "reserved_pages": reserved_pages,
+        "available_pages": available_pages,
+        "required_pages": required_pages,
+        "available_memory_mb": available_memory_mb,
+        "failure_kind": None if ok else ("capacity" if valid else "capability"),
+        "error": error,
+    }
+
+
 def is_docker_runtime() -> bool:
     if Path("/.dockerenv").exists() or Path("/.containerenv").exists():
         return True
@@ -355,9 +398,89 @@ def is_docker_runtime() -> bool:
     return bool(re.search(r"docker|containerd|kubepods|libpod", cgroup))
 
 
+def _command_roots() -> list[Path]:
+    roots: list[Path] = []
+    for command in ("npu-smi", "hccn_tool", "urma_admin", "dscli"):
+        executable = shutil.which(command)
+        if not executable:
+            continue
+        resolved = Path(executable).resolve()
+        roots.append(resolved.parent)
+        if resolved.parent.parent != resolved.parent:
+            roots.append(resolved.parent.parent)
+    return roots
+
+
+def _mount_roots() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        for line in Path("/proc/self/mountinfo").read_text(encoding="ascii", errors="replace").splitlines():
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            mount_point = Path(fields[4])
+            if mount_point not in roots:
+                roots.append(mount_point)
+    except OSError:
+        pass
+    return roots
+
+
+def _candidate_roots() -> list[Path]:
+    roots: list[Path] = [Path("/"), Path("/usr/local/Ascend"), Path("/etc"), Path("/lib")]
+    roots.extend(_command_roots())
+    roots.extend(_mount_roots())
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def _find_path(default: Path, relative_candidates: tuple[str, ...]) -> Path | None:
+    if default.exists():
+        return default
+    for root in _candidate_roots():
+        for relative in relative_candidates:
+            candidate = root / relative
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _ascend_driver_dir() -> Path | None:
+    default = Path("/usr/local/Ascend/driver")
+    if default.is_dir():
+        return default
+    for root in _candidate_roots():
+        candidate = root / "driver"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _ascend_toolkit_roots() -> list[Path]:
+    roots: list[Path] = []
+    default = Path("/usr/local/Ascend/ascend-toolkit/latest")
+    if default.is_dir():
+        roots.append(default)
+    for root in _candidate_roots():
+        candidate = root / "ascend-toolkit" / "latest"
+        if candidate.is_dir() and candidate not in roots:
+            roots.append(candidate)
+    for env_name in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
+        value = os.environ.get(env_name)
+        if value:
+            candidate = Path(value)
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+    return roots
+
+
 def probe_docker_prereqs() -> dict[str, Any]:
     """Check generic and 950PR&950DT Products-specific devices, tools, and configuration paths."""
     devices = sorted(str(path) for path in Path("/dev").glob("davinci*"))
+    driver_dir = _ascend_driver_dir()
     return {
         "docker": is_docker_runtime(),
         "npu_smi": bool(shutil.which("npu-smi")),
@@ -366,30 +489,33 @@ def probe_docker_prereqs() -> dict[str, Any]:
         "urma_ping": shutil.which("urma_ping") is not None,
         "devices": devices,
         "davinci_device_count": len(devices),
-        "davinci_manager": Path("/dev/davinci_manager").exists(),
-        "hisi_hdc": Path("/dev/hisi_hdc").exists(),
-        "driver_dir": Path("/usr/local/Ascend/driver").is_dir(),
-        "hccn_conf": Path("/etc/hccn.conf").is_file(),
-        "ummu_device": Path("/dev/ummu").exists(),
-        "uburma_device": Path("/dev/uburma").exists(),
-        "hccl_rootinfo": Path("/etc/hccl_rootinfo.json").is_file(),
-        "hixlep_dir": Path("/etc/hixlep").is_dir(),
-        "route_conf": Path("/lib/route.conf").is_file(),
+        "davinci_manager": _find_path(Path("/dev/davinci_manager"), ("dev/davinci_manager",)) is not None,
+        "hisi_hdc": _find_path(Path("/dev/hisi_hdc"), ("dev/hisi_hdc",)) is not None,
+        "driver_dir": driver_dir is not None,
+        "hccn_conf": _find_path(Path("/etc/hccn.conf"), ("etc/hccn.conf",)) is not None,
+        "ummu_device": _find_path(Path("/dev/ummu"), ("dev/ummu",)) is not None,
+        "uburma_device": _find_path(Path("/dev/uburma"), ("dev/uburma",)) is not None,
+        "hccl_rootinfo": _find_path(Path("/etc/hccl_rootinfo.json"), ("etc/hccl_rootinfo.json",)) is not None,
+        "hixlep_dir": _find_path(Path("/etc/hixlep"), ("etc/hixlep",)) is not None,
+        "route_conf": _find_path(Path("/lib/route.conf"), ("lib/route.conf",)) is not None,
     }
 
 
 def find_hccn_tool() -> str | None:
-    return shutil.which("hccn_tool") or next(
-        (
-            str(path)
-            for path in (
-                Path("/usr/local/Ascend/driver/tools/hccn_tool"),
-                Path("/usr/local/Ascend/driver/bin/hccn_tool"),
-            )
-            if path.is_file() and os.access(path, os.X_OK)
-        ),
-        None,
+    executable = shutil.which("hccn_tool")
+    if executable:
+        return executable
+    driver_dir = _ascend_driver_dir()
+    if driver_dir:
+        for relative in ("tools/hccn_tool", "bin/hccn_tool"):
+            candidate = driver_dir / relative
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    candidate = _find_path(
+        Path("/usr/local/Ascend/driver/tools/hccn_tool"),
+        ("driver/tools/hccn_tool", "driver/bin/hccn_tool"),
     )
+    return str(candidate) if candidate else None
 
 
 def parse_roce_ip(output: str) -> str | None:
@@ -1034,6 +1160,47 @@ def probe_package_versions(names: list[str]) -> dict[str, Any]:
     return {"versions": versions}
 
 
+def probe_yuanrong_runtime() -> dict[str, Any]:
+    """Check Yuanrong package metadata, module loading, and dscli availability."""
+    try:
+        package_version = importlib.metadata.version("openyuanrong-datasystem")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = None
+    import_rc, import_output, import_error = run_cmd(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from yr.datasystem.hetero_client import HeteroClient; "
+                "from yr.datasystem.kv_client import ExistenceOpt, SetParam; "
+                "from yr.datasystem.object_client import WriteMode"
+            ),
+        ],
+        timeout=30,
+    )
+    dscli = shutil.which("dscli")
+    dscli_rc = 127
+    dscli_output = ""
+    dscli_error = "dscli is not available"
+    if dscli:
+        dscli_rc, dscli_output, dscli_error = run_cmd([dscli, "--version"], timeout=15)
+    import_text = import_output or import_error
+    import_diagnostic = next(
+        (line.strip() for line in reversed(import_text.splitlines()) if line.strip()),
+        import_text,
+    )
+    return {
+        "package": "openyuanrong-datasystem",
+        "package_version": package_version,
+        "import_rc": import_rc,
+        "import_output": redact(import_diagnostic)[:1000],
+        "dscli": dscli,
+        "dscli_rc": dscli_rc,
+        "dscli_output": redact(dscli_output or dscli_error)[:1000],
+        "ok": package_version is not None and import_rc == 0 and bool(dscli) and dscli_rc == 0,
+    }
+
+
 def probe_ssd_storage(path_text: str, backend: str) -> dict[str, Any]:
     """Check SSD Offload path type, mount state, and availability for the backend."""
     if not path_text:
@@ -1115,15 +1282,15 @@ def probe_hdk() -> dict[str, Any]:
         rc, out, err = run_cmd(list(argv), timeout=10)
         if out or err:
             sources.append({"source": " ".join(argv), "rc": rc, "output": redact(out or err)})
-    paths = [
-        "/usr/local/Ascend/driver/version.info",
-        "/usr/local/Ascend/driver/version.info.txt",
-        "/etc/ascend_install.info",
-    ]
-    toolkit_roots = [Path("/usr/local/Ascend/ascend-toolkit/latest")]
-    for env_name in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
-        if os.environ.get(env_name):
-            toolkit_roots.append(Path(os.environ[env_name]))
+    driver_dir = _ascend_driver_dir()
+    paths = []
+    if driver_dir:
+        paths.append(str(driver_dir / "version.info"))
+        paths.append(str(driver_dir / "version.info.txt"))
+    install_info = _find_path(Path("/etc/ascend_install.info"), ("etc/ascend_install.info",))
+    if install_info:
+        paths.append(str(install_info))
+    toolkit_roots = _ascend_toolkit_roots()
     for root in toolkit_roots:
         paths.extend(str(path) for path in root.glob("**/ascend_toolkit_install.info"))
         paths.extend(str(path) for path in root.glob("**/version.cfg"))
@@ -1621,6 +1788,8 @@ PROBES: dict[str, Callable[[CheckContext, list[dict[str, Any]]], dict[str, Any]]
     "kernel": lambda context, rules: {**probe_kernel(), "deployment_mode": context.deployment_mode},
     "memory_scan": lambda context, rules: probe_memory_capacity(context.hardware, context.managed_memory_mb),
     "a5_memory": lambda context, rules: probe_a5_memory_capacity(context.managed_memory_mb),
+    "yuanrong_memory": lambda context, rules: probe_yuanrong_memory_capacity(context.managed_memory_mb),
+    "yuanrong_runtime": lambda context, rules: probe_yuanrong_runtime(),
     "a5_hugepages": lambda context, rules: probe_a5_hugepages(),
     "a5_docker_prereqs": lambda context, rules: probe_docker_prereqs(),
     "a5_secverify": lambda context, rules: probe_a5_secverify(),
@@ -2332,6 +2501,55 @@ def evaluate_package_version(rule: dict[str, Any], probes: dict[str, Any]) -> di
     return make_record(rule, status, evidence, f"Detected {name}={version}, required>={threshold}")
 
 
+def evaluate_yuanrong_runtime(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Yuanrong package loading and dscli availability."""
+    probe = probes["yuanrong_runtime"]
+    issues = []
+    if not probe.get("package_version"):
+        issues.append("openyuanrong-datasystem is not installed")
+    if probe.get("import_rc") != 0:
+        issues.append(f"Yuanrong Python modules cannot be imported: {probe.get('import_output') or 'no output'}")
+    if not probe.get("dscli"):
+        issues.append("dscli is not available")
+    elif probe.get("dscli_rc") != 0:
+        issues.append(f"dscli --version failed: {probe.get('dscli_output') or 'no output'}")
+    status = "BLOCK" if issues else "PASS"
+    detail = (
+        f"package={probe.get('package')} version={probe.get('package_version') or '-'}; "
+        f"import_rc={probe.get('import_rc')}; dscli={probe.get('dscli') or '-'}; "
+        f"dscli_rc={probe.get('dscli_rc')}"
+    )
+    if issues:
+        detail += "; " + "; ".join(issues)
+    return make_record(rule, status, probe, detail)
+
+
+def evaluate_yuanrong_memory(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Yuanrong HugeTLB capacity against the shared managed-memory target."""
+    probe = probes["yuanrong_memory"]
+    status = "PASS" if probe.get("ok") else "BLOCK"
+    detail = (
+        f"target={probe.get('managed_memory_mb')}MB; page size={probe.get('page_size_kb') or '-'}kB; "
+        f"free pages={probe.get('free_pages') if probe.get('free_pages') is not None else '-'}; "
+        f"reserved pages={probe.get('reserved_pages') if probe.get('reserved_pages') is not None else '-'}; "
+        f"allocatable pages={probe.get('available_pages') if probe.get('available_pages') is not None else '-'}; "
+        f"required pages={probe.get('required_pages')}; "
+        f"available={probe.get('available_memory_mb') if probe.get('available_memory_mb') is not None else '-'}MB"
+    )
+    if probe.get("error"):
+        detail += f"; error={probe['error']}"
+    result = make_record(rule, status, probe, detail)
+    if status == "BLOCK" and probe.get("failure_kind") == "capacity":
+        result["remediation"]["description"] = (
+            "Increase free 2MB HugeTLB capacity or reduce --managed-memory-mb, then rerun the check."
+        )
+    elif status == "BLOCK":
+        result["remediation"]["description"] = (
+            "Restore readable 2MB HugeTLB evidence in /proc/meminfo, then rerun the check."
+        )
+    return result
+
+
 def evaluate_ssd_storage(rule: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
     """Evaluate Offload storage conditions for the current backend using SSD probe evidence."""
     probe = probes["ssd_storage"]
@@ -2649,6 +2867,8 @@ EVALUATORS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] 
     "docker_prereqs": evaluate_docker_prereqs,
     "manual_confirmation": evaluate_manual_confirmation,
     "package_version": evaluate_package_version,
+    "yuanrong_runtime": evaluate_yuanrong_runtime,
+    "yuanrong_memory": evaluate_yuanrong_memory,
     "ssd_storage": evaluate_ssd_storage,
     "roce_link": evaluate_roce_link,
     "roce_local": evaluate_roce_local,
@@ -2675,6 +2895,8 @@ def build_probe_plan(rules: list[dict[str, Any]]) -> dict[str, list[dict[str, An
 PROBE_LABELS = {
     "memory_scan": "managed memory check",
     "a5_memory": "950PR&950DT Products host memory check",
+    "yuanrong_memory": "Yuanrong HugeTLB capacity check",
+    "yuanrong_runtime": "Yuanrong package check",
     "a5_hugepages": "950PR&950DT Products huge-page check",
     "a5_docker_prereqs": "950PR&950DT Products device and configuration mount check",
     "a5_secverify": "950PR&950DT Products custom-op signature state check",
@@ -3198,6 +3420,10 @@ def build_parser(catalog_data: dict[str, Any]) -> argparse.ArgumentParser:
             "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
             "--hardware A5 --backend mooncake --managed-memory-mb 32768 "
             "--deployment-mode multi-node --link-type ub --peer-eid <remote-eid>\n\n"
+            "  Validate a Yuanrong deployment:\n"
+            "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
+            "--hardware A3 --backend yuanrong --managed-memory-mb 40960 "
+            "--deployment-mode multi-node --link-type hccs\n\n"
             "  Authorize supported local repairs:\n"
             "    python -m vllm_ascend.distributed.kv_transfer.utils.envcheck.kvpool_envcheck "
             "--hardware A3 --backend memcache --managed-memory-mb 32768 "
@@ -3352,6 +3578,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise InputError("Check mode requires --managed-memory-mb to be greater than 0")
             if args.ssd_path and not args.ssd_offload:
                 raise InputError("--ssd-path can be used only with --ssd-offload")
+            if args.backend.strip().lower() == "yuanrong" and args.ssd_offload:
+                raise InputError("--ssd-offload is not supported for --backend yuanrong")
             if args.peer_eid and (
                 args.hardware.strip().upper() != "A5"
                 or args.link_type.strip().lower() != "ub"
